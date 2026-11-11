@@ -77,6 +77,12 @@ file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.cpp")
 
 add_executable(mt4g ${SOURCES})
 
+# EXPERIMENT BRANCH ONLY: knobs for the main-memory latency investigation, e.g.
+# -DMM_EXP_DEFS="MM_WARMUP_HOPS=0;MM_SCRUB=0". Only this one file recompiles when they change.
+set(MM_EXP_DEFS "" CACHE STRING "Compile definitions for mainMemoryLatency.cpp (experiment only)")
+set_source_files_properties(${CMAKE_SOURCE_DIR}/src/benchmarks/latency/mainMemoryLatency.cpp
+    PROPERTIES COMPILE_DEFINITIONS "${MM_EXP_DEFS}")
+
 target_include_directories(mt4g PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_features(mt4g PRIVATE cxx_std_20)
 target_link_libraries(mt4g PRIVATE

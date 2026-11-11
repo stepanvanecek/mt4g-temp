@@ -1,0 +1,7 @@
+# The repo-wide .gitignore excludes *.txt, *.png and mt4g* - keep the raw traces and plots of this study.
+!*.txt
+!*.png
+# Rebuildable binaries and build directory.
+bins/
+build/
+build.*.log

@@ -326,7 +326,9 @@ int main(int argc, char* argv[]) {
 
         if (l1Size.confidence > VALIDITY_THRESHOLD) {
             
-            if (opts.runOptimalSearch)
+            // EXPERIMENT BRANCH ONLY: compile fix for 3bbd6f0 (upstream removed --optimal and the
+            // non-sweep L1 bandwidth functions); the block sweep is now the only path.
+            if (true)
             {
                 std::cout << "[L1] Read Bandwidth per CU / MultiProcessor with optimal search" << std::endl;
                 CacheBandwidthResult l1ReadBandwidth;
@@ -357,20 +359,6 @@ int main(int argc, char* argv[]) {
                     util::writeBandwidthGridToCSV(l1ReadBandwidth, (graphDir / util::bandwidthGridFileName(fancyFileName, l1Label, "Read")).string());
                     util::writeBandwidthGridToCSV(l1WriteBandwidth, (graphDir / util::bandwidthGridFileName(fancyFileName, l1Label, "Write")).string());
                 }
-            }
-            else
-            {
-                std::cout << "[L1] Read Bandwidth per CU / MultiProcessor" << std::endl;
-                result["memory"]["l1"]["readBandwidthPerCU"] = {
-                    {"value", timed("l1ReadBandwidth", [&] { return benchmark::measureL1ReadBandwidth(l1Size.size / 2); })},
-                    {"unit", "GiB/s"}
-                };
-
-                std::cout << "[L1] Write Bandwidth per CU / MultiProcessor" << std::endl;
-                result["memory"]["l1"]["writeBandwidthPerCU"] = {
-                    {"value", timed("l1WriteBandwidth", [&] { return benchmark::measureL1WriteBandwidth(l1Size.size / 2); })},
-                    {"unit", "GiB/s"}
-                };
             }
         } else {
             std::cout << "Could not measure valid L1 Size, skipping L1 Bandwidth benchmarks." << std::endl;
@@ -925,6 +913,11 @@ int main(int argc, char* argv[]) {
         result["memory"]["main"]["latency"]["allocator"] = allocatorName;
         if (opts.rawData) {
             util::writeVectorToFile(mainMemLatency.timings, (graphDir / (fancyFileName + "__Main_Memory_Latency.txt")).string());
+        }
+        // EXPERIMENT BRANCH ONLY: stop after the latency trace, skipping the bandwidth sweeps.
+        if (std::getenv("MT4G_EXP_MM_LATENCY_ONLY")) {
+            std::cout << "[Main Memory] MT4G_EXP_MM_LATENCY_ONLY set, exiting after latency" << std::endl;
+            std::exit(EXIT_SUCCESS);
         }
 
         result["memory"]["main"]["bandwidthAllocator"] = allocatorName;

@@ -6,10 +6,81 @@
 #include <numeric>
 #include <optional>
 
-static constexpr auto SAMPLE_SIZE = 2048;// 2048 Loads should suffice to rule out random flukes
-static constexpr auto WARMUP_HOPS = SAMPLE_SIZE;
+// STUDY BRANCH ONLY (mm-latency-warmup-study, see experiments/mm-latency-warmup) -- never merge.
+// Compile-time switches (set via -DMM_EXP_DEFS="..." at CMake configure time).
+// The defaults reproduce my-pr45-improvements HEAD (3bbd6f0) exactly.
+//   MM_ORIGINAL      0: current implementation, 1: original implementation (32ebe6b^)
+//   MM_SAMPLE_SIZE   number of timed loads (default 2048)
+//   MM_WARMUP_HOPS   current implementation: untimed loads before the timed loop (default SAMPLE_SIZE)
+//   MM_SCRUB         current implementation: 1 runs the scrub kernel, 0 skips it
+#ifndef MM_ORIGINAL
+#define MM_ORIGINAL 0
+#endif
+#ifndef MM_SAMPLE_SIZE
+#define MM_SAMPLE_SIZE 2048
+#endif
+#ifndef MM_WARMUP_HOPS
+#define MM_WARMUP_HOPS SAMPLE_SIZE
+#endif
+#ifndef MM_SCRUB
+#define MM_SCRUB 1
+#endif
+
+static constexpr auto SAMPLE_SIZE = MM_SAMPLE_SIZE;// 2048 Loads should suffice to rule out random flukes
+static constexpr auto WARMUP_HOPS = MM_WARMUP_HOPS;
 static constexpr size_t SCRUB_STRIDE_BYTES = 64;
 
+#if MM_ORIGINAL
+// ---------------------------------------------------------------------------------------------
+// Original implementation (src/benchmarks/latency/mainMemoryLatency.cpp at 32ebe6b^), verbatim
+// except for the unused util::AllocatorType parameter required by the current interface.
+// ---------------------------------------------------------------------------------------------
+__global__ void mainMemoryLatencyKernel(uint32_t *pChaseArray, uint32_t *timingResults) {
+    uint32_t index = 0;
+    __shared__ uint64_t s_timings[SAMPLE_SIZE];
+
+    // Do not load from caches
+    for (uint32_t i = 0; i < SAMPLE_SIZE; ++i) {
+        uint64_t start = __timer();
+        index = __forceBypassAllCacheReads(pChaseArray, index);
+        uint64_t end = __timer();
+
+        s_timings[i] = end - start;
+    }
+
+    for (uint32_t i = 0; i < SAMPLE_SIZE; ++i) {
+        timingResults[i] = s_timings[i];
+    }
+
+    timingResults[0] += index >> util::min(index / 2, 32);
+}
+
+
+
+std::vector<uint32_t> mainMemoryLatencyLauncher(size_t arraySizeBytes, size_t strideBytes,
+                                                util::AllocatorType) {
+    util::hipDeviceReset();
+
+    constexpr size_t resultCount = SAMPLE_SIZE;
+
+    // Initialize device Arrays
+    uint32_t *d_pChaseArray = util::allocateGPUMemory(util::generateRandomizedPChaseArray(arraySizeBytes, strideBytes));
+    uint32_t *d_timingResults = util::allocateGPUMemory(resultCount);
+
+    util::hipCheck(hipDeviceSynchronize());
+    mainMemoryLatencyKernel<<<1, 1>>>(d_pChaseArray, d_timingResults);
+
+    std::vector<uint32_t> timingResultBuffer = util::copyFromDevice(d_timingResults, resultCount);
+
+    timingResultBuffer.erase(timingResultBuffer.begin());
+
+    return timingResultBuffer;
+}
+
+#else
+// ---------------------------------------------------------------------------------------------
+// Current implementation (my-pr45-improvements HEAD) with switches.
+// ---------------------------------------------------------------------------------------------
 __global__ void mainMemoryLatencyKernel(uint32_t *pChaseArray, uint32_t *timingResults) {
     uint32_t index = 0;
     __shared__ uint64_t s_timings[SAMPLE_SIZE];
@@ -22,8 +93,8 @@ __global__ void mainMemoryLatencyKernel(uint32_t *pChaseArray, uint32_t *timingR
     // Do not load from the CU cache or L2.
     for (uint32_t i = 0; i < SAMPLE_SIZE; ++i) {
         uint64_t start = __timer();
-        index = __forceBypassAllCacheReads(pChaseArray, index); 
-        uint64_t end = __timer(); 
+        index = __forceBypassAllCacheReads(pChaseArray, index);
+        uint64_t end = __timer();
 
         s_timings[i] = end - start;
     }
@@ -64,7 +135,7 @@ __global__ void mainMemoryLatencyScrubKernel(const uint32_t *source, size_t coun
 
 std::vector<uint32_t> mainMemoryLatencyLauncher(size_t arraySizeBytes, size_t strideBytes,
                                                 util::AllocatorType allocType) {
-    util::hipDeviceReset(); 
+    util::hipDeviceReset();
 
     std::vector<uint32_t> hostChaseArray = util::generateRandomizedPChaseArray(arraySizeBytes, strideBytes);
 
@@ -79,6 +150,7 @@ std::vector<uint32_t> mainMemoryLatencyLauncher(size_t arraySizeBytes, size_t st
     mainMemoryLatencyInitKernel<<<blocks, threads>>>(d_pChaseArray, d_initArray, hostChaseArray.size());
     util::hipCheck(hipDeviceSynchronize());
 
+#if MM_SCRUB
     // Apply cache pressure before measuring the pointer chase.
     const size_t scrubSinkSize = static_cast<size_t>(blocks) * threads;
     uint32_t *d_scrubSink = util::allocateGPUMemory(scrubSinkSize);
@@ -87,18 +159,22 @@ std::vector<uint32_t> mainMemoryLatencyLauncher(size_t arraySizeBytes, size_t st
     util::hipCheck(hipDeviceSynchronize());
 
     util::hipCheck(hipFree(d_scrubSink));
+#endif
     util::hipCheck(hipFree(d_initArray));
     uint32_t *d_timingResults = util::allocateGPUMemory(SAMPLE_SIZE + 1);
 
     util::hipCheck(hipDeviceSynchronize());
     mainMemoryLatencyKernel<<<1, 1>>>(d_pChaseArray, d_timingResults);
 
-    std::vector<uint32_t> timingResultBuffer = util::copyFromDevice(d_timingResults, SAMPLE_SIZE);
+    std::vector<uint32_t> timingResultBuffer = util::copyFromDevice(d_timingResults, SAMPLE_SIZE + 1);
+    // Drop the final-index sink (the last element).
+    timingResultBuffer.erase(timingResultBuffer.begin() + SAMPLE_SIZE);
 
     util::freeMemory(d_pChaseArray, allocType);
     util::hipCheck(hipFree(d_timingResults));
     return timingResultBuffer;
 }
+#endif
 
 namespace benchmark {
     CacheLatencyResult measureMainMemoryLatency(util::AllocatorType allocType) {
