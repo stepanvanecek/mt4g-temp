@@ -39,11 +39,12 @@ pause before every run.
   - D, with scrub but no warm-up, looks the same as B, with neither.
 - **With warm-up (C, E):** no run has it (0/10 each). The first 100 samples equal the rest (689 vs 691, and
   720 vs 720 cycles).
-- **Scrubbing:** has no visible effect.
+- **Scrubbing:** does not remove the initial high latency.
   - With warm-up, C vs E: std 92 vs 89.
   - Without warm-up, B vs D: std 147 vs 147.
-  - The mean differences between these pairs (about 30 cycles) are within the normal run-to-run variation of
-    this benchmark.
+  - The mean differences between these pairs (about 30 cycles) were first put down to run-to-run variation. That
+    was an untested assumption: with 40 runs per config, scrub makes results about 11–15 cycles slower. See
+    "Cache scrub: what it does and whether it matters" below.
 - **The warm-up lowers the std** (147 → 89–92 on the current code) because the slow start-up samples are no
   longer recorded.
 
@@ -58,6 +59,8 @@ pause before every run.
 | `scripts/build_configs.sh` | builds `bins/mt4g-<cfg>` (the config list is at the top of the script) |
 | `scripts/run.sh` | `scripts/run.sh 10 <gpu> A B C D E` |
 | `scripts/analyze.py` | makes the plots and the table |
+| `scripts/scrub_check.sh` | L2 counters with/without scrub and the two L2 tests in `scrub-check/` (AMD only) |
+| `scripts/analyze_scrub40.py` | 40-run scrub comparison table from `results/scrub40/` |
 
 To build the configurations, `src/benchmarks/latency/mainMemoryLatency.cpp` on this branch has three compile-time
 switches: `MM_ORIGINAL`, `MM_WARMUP_HOPS` and `MM_SCRUB`. `CMakeLists.txt` passes them in through
@@ -137,3 +140,89 @@ python3 scripts/analyze_round2.py results/<gpu>/round2 <GPU-name>
 - **SAMPLE_SIZE:** stays within the default 48 KiB of static shared memory up to 6144 (the largest value used here
   is 4096).
 - **Plots:** for any GPU other than the MI210, the y-axis is scaled automatically.
+
+## Cache scrub: what it does and whether it matters (MI210)
+
+### The caches involved
+
+| Level | Size | Line size | Shared by |
+|---|---|---|---|
+| vL1 (vector L1) | 16 KiB | 64 B | one compute unit (CU) |
+| L2 | 8 MiB | 128 B (measured by mt4g) | all 104 CUs |
+| Main memory (HBM) | 64 GiB | – | – |
+
+The MI210 has no cache between L2 and main memory (the MI300A has a 256 MB Infinity Cache there). The measuring
+load skips vL1, so the only cache that could serve it is L2.
+
+### What the scrub kernel does
+
+Before the measuring kernel, the launcher runs:
+
+1. **Init kernel:** 3,328 blocks × 256 threads copy the chain from `d_initArray` (a 1 GiB copy uploaded from the
+   host) into `d_pChaseArray` (the array that is measured).
+2. **Scrub kernel:** the same grid reads `d_initArray`, **not** the measured array. Each thread reads one 4-byte word
+   every 64 bytes (`SCRUB_STRIDE_BYTES`) and XORs the values into a small output array, so the compiler cannot
+   delete the loads.
+3. `d_initArray` is freed, then the measuring kernel runs on one thread.
+
+The idea: after the init kernel, L2 holds the last ~8 MiB touched, possibly including parts of the measured array.
+A timed load that hit such a line would take about 300 cycles instead of about 700. Reading 1 GiB of other data
+(128 × the L2 size) should push those lines out. The code comment itself says it "is not a guaranteed cache flush".
+
+The scrub does not use the line size mt4g measures. With 64 B steps and 128 B L2 lines, every line is read twice:
+the counters below show 16.8 M L2 requests but only 8.4 M misses, one per 128 B line. That only doubles the work.
+For pushing data out, the step size barely matters: what matters is the amount of different data read. Even a
+1 KiB step over 1 GiB would bring 128 MiB of lines into L2, 16 × its size.
+
+### Does it remove anything? (`results/scrub-check/`, `scripts/scrub_check.sh`)
+
+**On the MI210 it has nothing to remove: L2 does not keep data from one kernel to the next.**
+
+- **The measuring load does hit L2 within one kernel** (`scrub-check/same_kernel_l2.cpp`). mt4g's
+  `__forceBypassAllCacheReads` (`flat_load_dword glc slc`) says it bypasses L1 and L2, but a line loaded earlier in
+  the same kernel comes back in about 290 cycles instead of about 570, and counts as an L2 hit. So it skips vL1 only.
+- **Data cached by an earlier kernel is gone** (`scrub-check/cross_kernel_l2.cpp`). Lines loaded by one kernel
+  take the main-memory latency (about 560–580 cycles) in the next kernel, even with a load that is allowed to hit L2.
+- **The measuring kernel's L2 counters are the same with and without scrub** (rocprofv3, 3 runs each, each with a
+  different random chain):
+
+| | L2 requests | L2 hits | L2 misses | Main-memory reads |
+|---|---|---|---|---|
+| C (no scrub) | 4,701–4,703 | 459 | 4,242–4,244 | 4,188–4,190 |
+| E (scrub) | 4,701–4,702 | 459 | 4,242–4,243 | 4,188–4,189 |
+
+  The kernel does 4,096 chain loads (2,048 warm-up + 2,048 timed), and there are at least that many main-memory
+  reads. The 459 hits are the same in every run regardless of the chain, so they come from the kernel's other
+  traffic (result writes, code and argument fetches), not from chain loads.
+- **Even if L2 kept data, the effect would be tiny.** Each chain entry is visited once, and at most 8 MiB of the
+  1 GiB array fits in L2, so fewer than 1% of the loads could hit.
+
+### Does it change the result? (`results/scrub40/`, `scripts/analyze_scrub40.py`)
+
+A further 40 runs each of B, C, D and E (`scripts/run.sh 40 1 B C D E`, shuffled per round). Each run settles at
+one of two levels, about 672 or about 732 cycles; a run counts as "high" when its median is above 700.
+
+| cfg | scrub | warm-up | runs | mean of run means | sd of run means | runs at high level |
+|---|---|---|---|---|---|---|
+| B | off | off | 40 | 721 | 30 | 14/40 |
+| D | on | off | 40 | 732 | 28 | 23/40 |
+| C | off | on | 40 | 704 | 31 | 17/40 |
+| E | on | on | 40 | 719 | 24 | 30/40 |
+
+| comparison | difference (scrub - no scrub) | permutation p |
+|---|---|---|
+| E - C (warm-up on) | +15.0 cycles | 0.018 |
+| D - B (warm-up off) | +11.4 cycles | 0.085 |
+
+- Scrub makes results about 11–15 cycles (about 2%) slower, by making more runs land at the high level.
+- It is not caused by what is in L2, since the counters are identical. The cause is unknown; physical memory
+  placement or GPU state left by the heavy 1 GiB kernel are possible explanations, neither tested.
+- With 10 runs per config the smallest reliably detectable difference was about 34 cycles, which is why round 1
+  could not tell this apart from noise.
+
+### Conclusions
+
+- On the MI210 the scrub does not remove anything the measuring kernel could use; every chain load goes to main
+  memory with or without it. It does shift the measured latency up by about 2%.
+- It may still matter on the MI300A, whose Infinity Cache sits in front of main memory and probably is not
+  cleared between kernels. That has not been tested, and CDNA3 uses a different load (`sc0 sc1 nt`).

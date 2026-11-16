@@ -1,0 +1,13 @@
+== cross_kernel_l2 (lines loaded by an earlier kernel)
+1 bypass load, cold (after flush)              median 552  p10 528  p90 832 cycles
+2 bypass load, same lines again                median 576  p10 548  p90 660 cycles
+3 bypass load, after plain loads filled L2     median 576  p10 544  p90 820 cycles
+4 bypass load, cold again                      median 560  p10 528  p90 808 cycles
+5 glc-only load, cold (after flush)            median 580  p10 552  p90 828 cycles
+6 glc-only load, same lines again              median 572  p10 544  p90 664 cycles
+
+== same_kernel_l2 (lines loaded earlier in the same kernel)
+A pass1 glc     -> pass2 glc      (L2 hit expected)        median 288  p10 252  p90 340 cycles
+B pass1 glc     -> pass2 glc slc  (line is in L2)          median 284  p10 248  p90 336 cycles
+C pass1 glc slc -> pass2 glc slc  (mt4g load, twice)       median 296  p10 260  p90 340 cycles
+D pass1 glc slc -> pass2 glc      (did slc allocate?)      median 284  p10 248  p90 328 cycles
